@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use eyre::{bail, Context, Result};
+use eyre::{bail, eyre, Context, OptionExt, Result};
 use reqwest::Url;
-use scraper::Html;
+use scraper::selectable::Selectable;
+use scraper::{Html, Selector};
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -89,12 +90,46 @@ async fn main() -> Result<()> {
         .await
         .wrap_err("parsing to string");
 
-    info!(?page, "Page content");
+    //info!(?page, "Page content");
 
     let html = Html::parse_document(&page?);
-    // TODO: find subtitle url (good selector )
-    // let selector = Selector::parse("???")
-    
+
+    let selector = Selector::parse("table#search_results").map_err(|e| eyre!("{e:?}"))?;
+    let search_results_table = html.select(&selector).next().map(|elem| elem.html());
+
+    let mut sub_url = String::new();
+
+    if let Some(table) = search_results_table {
+        let tr_selector = Selector::parse("tr").map_err(|e| eyre!("{e:?}"))?;
+        let td_selector = Selector::parse("td").map_err(|e| eyre!("{e:?}"))?;
+        let a_selector = Selector::parse("a").map_err(|e| eyre!("{e:?}"))?;
+        let html = Html::parse_fragment(&table[..]);
+        //let tr_content = html.select(&tr_selector).skip(1).next().map(|e| e.value());
+        //println!("DEBUG_TR: {tr_content:?}");
+        let td_iterator = html
+                .select(&tr_selector).skip(1).next().map(|elem| {
+                    elem.select(&td_selector)
+                });
+        if let Some(mut td) = td_iterator {
+            td.next().ok_or_else(|| eyre!("No Movie title column"))?;
+            td.next().ok_or_else(|| eyre!("No Language column"))?;
+            td.next().ok_or_else(|| eyre!("No #CD column"))?;
+            td.next().ok_or_else(|| eyre!("No upload column"))?;
+            let _ = td.next().ok_or_else(|| eyre!("No Subtitle Download URL")).and_then(|elem| {
+                elem.select(&a_selector).next().ok_or_else(|| eyre!("No 'a' element")).and_then(|v| {
+                    v.value().attr("href").ok_or_else(|| eyre!("No href element")).and_then(|download_url| {
+                        sub_url = format!("{BASE_URL}{download_url}");
+                        Ok(())
+                    })
+                })
+            });
+        }
+    } else {
+        info!("Table has not been found");
+    }
+
+    info!("Url for sub download: {}", sub_url);
+
     //sub_url = html.slect(selector)
 
     Ok(())
