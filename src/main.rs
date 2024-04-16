@@ -1,8 +1,7 @@
-use std::iter::Zip;
 use std::path::PathBuf;
 
 use clap::Parser;
-use eyre::{bail, eyre, Context, OptionExt, Result};
+use eyre::{bail, eyre, Context, Result};
 use itertools::Itertools;
 use reqwest::Url;
 use scraper::selectable::Selectable;
@@ -25,6 +24,8 @@ struct Cli {
 
 const HASH_BLK_SIZE: u64 = 65536;
 
+/// Copied from https://trac.opensubtitles.org/projects/opensubtitles/wiki/HashSourceCodes
+#[allow(clippy::unused_io_amount)] // partial reads are fine as they are part of spec
 fn create_hash(file: File, fsize: u64) -> Result<String, std::io::Error> {
     let mut buf = [0u8; 8];
     let mut word: u64;
@@ -69,7 +70,7 @@ async fn main() -> Result<()> {
     } = Cli::parse();
 
     // println!("path to movie: {:?}, language: {:?} ", movie_path, language);
-    info!(?movie_path, language, "got");
+    info!(?movie_path, language, "Fetching subtitles");
 
     let fsize = fs::metadata(&movie_path)
         .wrap_err("getting file size")?
@@ -91,55 +92,53 @@ async fn main() -> Result<()> {
         .wrap_err("Fetching page")?
         .text()
         .await
-        .wrap_err("parsing to string");
+        .wrap_err("parsing to string")?;
 
     //info!(?page, "Page content");
 
-    let html = Html::parse_document(&page?);
+    let html = Html::parse_document(&page);
 
     let selector = Selector::parse("table#search_results").map_err(|e| eyre!("{e:?}"))?;
-    let search_results_table = html.select(&selector).next().map(|elem| elem.html());
+    let search_results_table = html
+        .select(&selector)
+        .next()
+        .map(|elem| elem.html())
+        .ok_or_else(|| eyre!("No table on page"))?;
 
-    let mut sub_url = String::new();
+    let selector = |selector| {
+        Selector::parse(selector).map_err(|e| eyre!("invalid selector: '{selector}': {e:?}"))
+    };
+    let tr_selector = selector("tr")?;
+    let td_selector = selector("td")?;
+    let a_selector = selector("a")?;
+    let html = Html::parse_fragment(&search_results_table[..]);
+    //let tr_content = html.select(&tr_selector).skip(1).next().map(|e| e.value());
+    //println!("DEBUG_TR: {tr_content:?}");
+    let mut td = html
+        .select(&tr_selector)
+        .nth(1)
+        .map(|elem| elem.select(&td_selector))
+        .ok_or_else(|| eyre!("No td element"))?;
 
-    if let Some(table) = search_results_table {
-        let tr_selector = Selector::parse("tr").map_err(|e| eyre!("{e:?}"))?;
-        let td_selector = Selector::parse("td").map_err(|e| eyre!("{e:?}"))?;
-        let a_selector = Selector::parse("a").map_err(|e| eyre!("{e:?}"))?;
-        let html = Html::parse_fragment(&table[..]);
-        //let tr_content = html.select(&tr_selector).skip(1).next().map(|e| e.value());
-        //println!("DEBUG_TR: {tr_content:?}");
-        let td_iterator = html
-            .select(&tr_selector)
-            .skip(1)
-            .next()
-            .map(|elem| elem.select(&td_selector));
-        if let Some(mut td) = td_iterator {
-            td.next().ok_or_else(|| eyre!("No Movie title column"))?;
-            td.next().ok_or_else(|| eyre!("No Language column"))?;
-            td.next().ok_or_else(|| eyre!("No #CD column"))?;
-            td.next().ok_or_else(|| eyre!("No upload column"))?;
-            let _ = td
-                .next()
-                .ok_or_else(|| eyre!("No Subtitle Download URL"))
-                .and_then(|elem| {
-                    elem.select(&a_selector)
-                        .next()
-                        .ok_or_else(|| eyre!("No 'a' element"))
-                        .and_then(|v| {
-                            v.value()
-                                .attr("href")
-                                .ok_or_else(|| eyre!("No href element"))
-                                .and_then(|download_url| {
-                                    sub_url = format!("{BASE_URL}{download_url}");
-                                    Ok(())
-                                })
-                        })
-                });
-        }
-    } else {
-        info!("Table has not been found");
-    }
+    let sub_url = {
+        td.next().ok_or_else(|| eyre!("No Movie title column"))?;
+        td.next().ok_or_else(|| eyre!("No Language column"))?;
+        td.next().ok_or_else(|| eyre!("No #CD column"))?;
+        td.next().ok_or_else(|| eyre!("No upload column"))?;
+        td.next()
+            .ok_or_else(|| eyre!("No Subtitle Download URL"))
+            .and_then(|elem| {
+                elem.select(&a_selector)
+                    .next()
+                    .ok_or_else(|| eyre!("No 'a' element"))
+                    .and_then(|v| {
+                        v.value()
+                            .attr("href")
+                            .ok_or_else(|| eyre!("No href element"))
+                            .map(|download_url| format!("{BASE_URL}{download_url}"))
+                    })
+            })?
+    };
 
     info!("Url for sub download: {}", sub_url);
     let download_url = Url::parse(&sub_url).wrap_err("Couldn't parse String to URL")?;
@@ -152,7 +151,7 @@ async fn main() -> Result<()> {
         .wrap_err("Getting full response")
         .map(|b| b.to_vec())?;
 
-    let mut cursor = Cursor::new(zip_buf);
+    let cursor = Cursor::new(zip_buf);
 
     let mut zip_archive = ZipArchive::new(cursor).wrap_err("Open the zip archive")?;
 
@@ -163,7 +162,7 @@ async fn main() -> Result<()> {
         .sorted_by_key(|name| name.to_lowercase().ends_with(".srt"))
         .rev()
         .collect::<Vec<_>>();
-    info!("Files in zip: {files:?}");
+    info!(?files, "Files in zip");
 
     for file_name in files {
         let extension = file_name
@@ -183,6 +182,8 @@ async fn main() -> Result<()> {
         tokio::fs::write(&subtitle_file_path, &file)
             .await
             .wrap_err_with(|| format!("Writing subtitle to {subtitle_file_path:?}"))?;
+
+        info!(?subtitle_file_path, "File extracted");
     }
 
     Ok(())
