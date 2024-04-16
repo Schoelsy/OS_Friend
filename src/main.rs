@@ -1,15 +1,18 @@
+use std::iter::Zip;
 use std::path::PathBuf;
 
 use clap::Parser;
 use eyre::{bail, eyre, Context, OptionExt, Result};
+use itertools::Itertools;
 use reqwest::Url;
 use scraper::selectable::Selectable;
 use scraper::{Html, Selector};
 use std::fs;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::mem;
 use tracing::info;
+use zip::ZipArchive;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -107,30 +110,80 @@ async fn main() -> Result<()> {
         //let tr_content = html.select(&tr_selector).skip(1).next().map(|e| e.value());
         //println!("DEBUG_TR: {tr_content:?}");
         let td_iterator = html
-                .select(&tr_selector).skip(1).next().map(|elem| {
-                    elem.select(&td_selector)
-                });
+            .select(&tr_selector)
+            .skip(1)
+            .next()
+            .map(|elem| elem.select(&td_selector));
         if let Some(mut td) = td_iterator {
             td.next().ok_or_else(|| eyre!("No Movie title column"))?;
             td.next().ok_or_else(|| eyre!("No Language column"))?;
             td.next().ok_or_else(|| eyre!("No #CD column"))?;
             td.next().ok_or_else(|| eyre!("No upload column"))?;
-            let _ = td.next().ok_or_else(|| eyre!("No Subtitle Download URL")).and_then(|elem| {
-                elem.select(&a_selector).next().ok_or_else(|| eyre!("No 'a' element")).and_then(|v| {
-                    v.value().attr("href").ok_or_else(|| eyre!("No href element")).and_then(|download_url| {
-                        sub_url = format!("{BASE_URL}{download_url}");
-                        Ok(())
-                    })
-                })
-            });
+            let _ = td
+                .next()
+                .ok_or_else(|| eyre!("No Subtitle Download URL"))
+                .and_then(|elem| {
+                    elem.select(&a_selector)
+                        .next()
+                        .ok_or_else(|| eyre!("No 'a' element"))
+                        .and_then(|v| {
+                            v.value()
+                                .attr("href")
+                                .ok_or_else(|| eyre!("No href element"))
+                                .and_then(|download_url| {
+                                    sub_url = format!("{BASE_URL}{download_url}");
+                                    Ok(())
+                                })
+                        })
+                });
         }
     } else {
         info!("Table has not been found");
     }
 
     info!("Url for sub download: {}", sub_url);
+    let download_url = Url::parse(&sub_url).wrap_err("Couldn't parse String to URL")?;
 
-    //sub_url = html.slect(selector)
+    let zip_buf = reqwest::get(download_url)
+        .await
+        .wrap_err("Downloading subtitles")?
+        .bytes()
+        .await
+        .wrap_err("Getting full response")
+        .map(|b| b.to_vec())?;
+
+    let mut cursor = Cursor::new(zip_buf);
+
+    let mut zip_archive = ZipArchive::new(cursor).wrap_err("Open the zip archive")?;
+
+    let files = zip_archive
+        .file_names()
+        .filter(|file| !file.to_lowercase().trim().ends_with(".nfo"))
+        .map(|name| name.to_string())
+        .sorted_by_key(|name| name.to_lowercase().ends_with(".srt"))
+        .rev()
+        .collect::<Vec<_>>();
+    info!("Files in zip: {files:?}");
+
+    for file_name in files {
+        let extension = file_name
+            .split('.')
+            .last()
+            .ok_or_else(|| eyre!("No file extension"))?;
+
+        let file = zip_archive
+            .by_name(&file_name)
+            .wrap_err(format!("Extracting {file_name}"))?
+            .bytes()
+            .map(|v| v.wrap_err("invalid byte"))
+            .collect::<Result<Vec<_>>>()?;
+
+        let subtitle_file_path = movie_path.with_extension(extension);
+
+        tokio::fs::write(&subtitle_file_path, &file)
+            .await
+            .wrap_err_with(|| format!("Writing subtitle to {subtitle_file_path:?}"))?;
+    }
 
     Ok(())
 }
